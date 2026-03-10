@@ -16,7 +16,7 @@ from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 # Client is initialized at module load. It reads ANTHROPIC_API_KEY from the environment.
 client = AsyncAnthropic()

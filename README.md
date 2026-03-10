@@ -12,7 +12,7 @@ Based on the architecture described by [Larsen Cundric at Browser Use](https://x
 │                                                           │
 │  ┌──────────┐    ┌───────────────┐    ┌────────────────┐  │
 │  │  Sandbox  │───▶│ Control Plane │───▶│ Anthropic API  │  │
-│  │  (Agent)  │    │   (FastAPI)   │    │(claude-haiku)  │  │
+│  │  (Agent)  │    │   (FastAPI)   │    │(haiku-4-5)     │  │
 │  └──────────┘    └───────┬───────┘    └────────────────┘  │
 │       │                  │                                │
 │       │ presigned URLs   │ real credentials               │
@@ -177,11 +177,11 @@ docker compose down -v
 
 ## Changing the LLM Model
 
-The default model is `claude-3-5-haiku-20241022`. To use a different Anthropic model:
+The default model is `claude-haiku-4-5-20251001`. To use a different Anthropic model:
 
 1. Set the env var on the control plane in `docker-compose.yml`:
    ```yaml
    environment:
-     - ANTHROPIC_MODEL=claude-opus-4-5
+     - ANTHROPIC_MODEL=claude-sonnet-4-6
    ```
 2. Restart: `docker compose up -d`
