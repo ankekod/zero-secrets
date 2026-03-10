@@ -1,0 +1,63 @@
+services:
+  # ===========================================
+  # Control Plane - holds all secrets, proxies everything
+  # ===========================================
+  control-plane:
+    build: ./control-plane
+    container_name: control-plane
+    ports:
+      - "8080:8080"
+    environment:
+      # The only service that ever sees the Anthropic API key.
+      # The sandbox never receives this — that's the whole point.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=agent-workspaces
+    networks:
+      - agent-network
+    depends_on:
+      - minio
+
+  # ===========================================
+  # MinIO - S3-compatible storage (replaces AWS S3)
+  # ===========================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    networks:
+      - agent-network
+
+  # ===========================================
+  # MinIO bootstrap - creates the bucket on startup
+  # ===========================================
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/agent-workspaces --ignore-existing;
+      echo 'Bucket ready';
+      "
+    networks:
+      - agent-network
+
+networks:
+  agent-network:
+    driver: bridge
+
+volumes:
+  minio-data:
