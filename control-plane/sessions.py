@@ -26,12 +26,7 @@ class Session:
 
 
 class SessionStore:
-    """
-    In-memory session store. Production would use a database.
-    
-    This is intentionally simple — the point of the demo is the
-    architecture pattern, not the persistence layer.
-    """
+    """In-memory session store. Production would use a persistent database."""
 
     def __init__(self):
         self._sessions: dict[str, Session] = {}

@@ -1,17 +1,8 @@
 """
-Agent — the core loop that runs inside the sandbox.
+Agent loop running inside the sandbox.
 
-This is intentionally simple to keep the demo focused on the
-infrastructure pattern, not the agent logic. A production agent
-would have tool calling, planning, error recovery, etc.
-
-The agent:
-1. Gets its task
-2. Sends messages to the LLM via the control plane gateway
-3. Parses actions (create_file, done) from the LLM response
-4. Executes actions locally
-5. Syncs files to S3
-6. Loops until done
+Sends messages to the LLM via the control plane, parses action blocks
+from responses, executes them locally, and syncs output files to S3.
 """
 
 import argparse
@@ -80,24 +71,19 @@ def execute_action(action: dict) -> str:
 async def run_agent(token: str, control_plane_url: str, session_id: str):
     """Main agent loop."""
 
-    logger.info(f"Agent starting for session {session_id}")
-    logger.info(f"Control plane: {control_plane_url}")
-    logger.info(f"Workspace: {WORKSPACE_DIR}")
+    logger.info(f"Agent starting (session={session_id}, workspace={WORKSPACE_DIR})")
 
-    # ── Security demo: prove env vars are gone ──
+    # Verify env vars were stripped by entrypoint.sh
     env_check = {
         "SESSION_TOKEN": os.environ.get("SESSION_TOKEN", "NOT SET"),
         "CONTROL_PLANE_URL": os.environ.get("CONTROL_PLANE_URL", "NOT SET"),
         "SESSION_ID": os.environ.get("SESSION_ID", "NOT SET"),
     }
-    logger.info(f"Environment variable check: {env_check}")
-    logger.info("(All should be 'NOT SET' — values are in memory only)")
+    logger.info(f"Environment check (all should be NOT SET): {env_check}")
 
-    # Initialize the gateway (our only way to talk to the outside world)
     gateway = ControlPlaneGateway(control_plane_url, token)
     file_sync = FileSync(gateway)
 
-    # The agent loop: send task, get response, execute actions, repeat
     iteration = 0
     task_message_sent = False
 
@@ -105,16 +91,14 @@ async def run_agent(token: str, control_plane_url: str, session_id: str):
         iteration += 1
         logger.info(f"── Iteration {iteration}/{MAX_ITERATIONS} ──")
 
-        # First iteration: the task is already seeded in conversation
-        # history by the launch script. We just ask the LLM to proceed.
+        # First iteration: task is already in history, prompt the LLM to begin
         if not task_message_sent:
             new_messages = [{"role": "user", "content": "Please complete the task described above. Create any files needed in the workspace."}]
             task_message_sent = True
         else:
-            # Subsequent iterations: send action results as context
             new_messages = [{"role": "user", "content": "Please continue with the task. If you're done, include a done action."}]
 
-        # Call LLM through the control plane
+
         try:
             result = await gateway.invoke_llm(new_messages)
         except Exception as e:
@@ -123,14 +107,12 @@ async def run_agent(token: str, control_plane_url: str, session_id: str):
             continue
 
         assistant_content = result["message"]["content"]
-        logger.info(f"LLM response ({result.get('tokens_used', '?')} tokens):")
-        logger.info(f"{assistant_content[:500]}...")
+        logger.info(f"LLM response ({result.get('tokens_used', '?')} tokens): {assistant_content[:500]}...")
 
-        # Parse and execute actions
         actions = parse_actions(assistant_content)
 
         if not actions:
-            logger.info("No actions in response. Asking for next steps...")
+            logger.info("No actions in response, continuing...")
             continue
 
         done = False
@@ -141,24 +123,22 @@ async def run_agent(token: str, control_plane_url: str, session_id: str):
             if action["action"] == "done":
                 done = True
 
-        # Sync any created files to S3
         synced = await file_sync.sync()
         if synced:
-            logger.info(f"Files synced to S3: {synced}")
+            logger.info(f"Synced files: {synced}")
 
         if done:
-            logger.info("=== Agent completed task ===")
+            logger.info("Task complete")
             break
 
-        # Persist action results for next iteration context
         await gateway.persist_messages([
             {"role": "user", "content": "Action results:\n" + "\n".join(action_results)}
         ])
 
     if iteration >= MAX_ITERATIONS:
-        logger.warning(f"Agent hit max iterations ({MAX_ITERATIONS})")
+        logger.warning(f"Reached max iterations ({MAX_ITERATIONS})")
 
-    logger.info("Sandbox shutting down.")
+    logger.info("Shutting down.")
 
 
 def main():

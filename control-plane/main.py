@@ -1,14 +1,9 @@
 """
-Control Plane — the single gateway between sandboxes and the outside world.
+Control plane — credential holder and API gateway for sandbox agents.
 
-This is the service that holds all credentials. Sandboxes authenticate
-with a session token and can only:
-- Invoke the LLM (via /llm/chat)
-- Get presigned URLs for file upload/download
-- Persist messages to conversation history
-
-The control plane is stateless in the sense that it can be horizontally
-scaled. Session state is held in-memory here (production would use a DB).
+Sandboxes authenticate with a session token and interact exclusively
+through this service: LLM calls, file storage URLs, and message persistence.
+Session state is held in-memory (production would use a persistent store).
 """
 
 import logging
@@ -41,7 +36,7 @@ async def startup_check():
         logger.warning(f"LLM not configured: {health.get('error')}")
 
 
-# ─── Auth dependency ────────────────────────────────────────────
+# ─── Auth ───────────────────────────────────────────────────────
 
 async def get_current_session(
     authorization: str = Header(..., description="Bearer {session_token}")
@@ -61,7 +56,7 @@ async def get_current_session(
     return session
 
 
-# ─── Session management (called by orchestrator, not sandbox) ───
+# ─── Sessions ───────────────────────────────────────────────────
 
 class CreateSessionRequest(BaseModel):
     task: str
@@ -69,7 +64,7 @@ class CreateSessionRequest(BaseModel):
 
 @app.post("/sessions")
 async def create_session(req: CreateSessionRequest):
-    """Create a new session. Returns the token to pass to the sandbox."""
+    """Create a new session and return the session token."""
     session = store.create_session(task=req.task)
     logger.info(f"Created session {session.session_id} for task: {req.task[:80]}")
     return {
@@ -117,7 +112,7 @@ async def deactivate_session(session_id: str):
     return {"status": "deactivated"}
 
 
-# ─── LLM Proxy (called by sandbox) ─────────────────────────────
+# ─── LLM Proxy ──────────────────────────────────────────────────
 
 class LLMRequest(BaseModel):
     new_messages: list[dict]
@@ -127,14 +122,10 @@ class LLMRequest(BaseModel):
 @app.post("/llm/chat")
 async def llm_chat(req: LLMRequest, session: Session = Depends(get_current_session)):
     """
-    The core LLM proxy endpoint.
-    
-    The sandbox sends only NEW messages. The control plane:
-    1. Fetches full conversation history from the session
-    2. Appends new messages
-    3. Sends everything to Ollama
-    4. Stores the full exchange in history
-    5. Returns only the assistant's response
+    Proxy LLM request for a session.
+
+    Merges new_messages with the stored conversation history, forwards to
+    the LLM, persists the full exchange, and returns the assistant response.
     """
     history = store.get_history(session.session_id)
 
@@ -144,11 +135,8 @@ async def llm_chat(req: LLMRequest, session: Session = Depends(get_current_sessi
         model=req.model,
     )
 
-    # Persist new messages + response to session history
     store.add_messages(session.session_id, req.new_messages)
     store.add_messages(session.session_id, [result["message"]])
-
-    # Track token usage
     session.total_tokens_used += result.get("tokens_used", 0)
 
     return {
@@ -158,7 +146,7 @@ async def llm_chat(req: LLMRequest, session: Session = Depends(get_current_sessi
     }
 
 
-# ─── Persist messages (for tool results, etc) ──────────────────
+# ─── Message Persistence ────────────────────────────────────────
 
 class PersistRequest(BaseModel):
     messages: list[dict]
@@ -173,7 +161,7 @@ async def persist_messages(
     return {"stored": len(req.messages)}
 
 
-# ─── File Storage (presigned URLs) ──────────────────────────────
+# ─── File Storage ───────────────────────────────────────────────
 
 class PresignedURLRequest(BaseModel):
     paths: list[str]
@@ -184,12 +172,7 @@ class PresignedURLRequest(BaseModel):
 async def get_presigned_urls(
     req: PresignedURLRequest, session: Session = Depends(get_current_session)
 ):
-    """
-    Generate presigned S3 URLs for file upload/download.
-    
-    The sandbox never sees storage credentials. It gets a time-limited
-    URL that can only access files within its session scope.
-    """
+    """Generate presigned S3 URLs for file upload/download, scoped to the session."""
     urls = []
     for path in req.paths:
         if req.action == "upload":

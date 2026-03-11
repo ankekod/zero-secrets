@@ -1,14 +1,5 @@
 """
-File Sync — uploads workspace files to S3 via presigned URLs.
-
-The sandbox writes files to /workspace. This module syncs them to
-MinIO/S3 without ever seeing storage credentials.
-
-Flow:
-1. Agent creates files in /workspace
-2. file_sync detects changes
-3. Asks control plane for presigned upload URLs
-4. Uploads directly to MinIO using those URLs
+Syncs /workspace files to S3 via presigned upload URLs obtained from the control plane.
 """
 
 import os
@@ -58,10 +49,8 @@ class FileSync:
 
         logger.info(f"Syncing {len(changed)} changed file(s): {changed}")
 
-        # Get presigned upload URLs from control plane
         urls = await self.gateway.get_upload_urls(changed)
 
-        # Upload each file directly to MinIO (no credentials needed!)
         synced = []
         for file_path, url_info in zip(changed, urls):
             full_path = os.path.join(WORKSPACE_DIR, file_path)

@@ -1,13 +1,5 @@
 """
-LLM Proxy — the control plane's interface to the actual LLM.
-
-The sandbox sends only new messages. The control plane:
-1. Looks up the full conversation history
-2. Reconstructs the complete context
-3. Forwards to the Anthropic API
-4. Returns the response
-
-The sandbox never talks to Anthropic directly — it doesn't even hold the API key.
+LLM proxy — reconstructs full conversation context and forwards requests to the Anthropic API.
 """
 
 import os
@@ -18,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-# Client is initialized at module load. It reads ANTHROPIC_API_KEY from the environment.
 client = AsyncAnthropic()
 
 SYSTEM_PROMPT = """You are a helpful AI agent running inside a secure sandbox.
@@ -49,10 +40,8 @@ async def invoke_llm(
     """
     model = model or MODEL
 
-    # Anthropic requires system content as a top-level parameter — system-role
-    # messages are not allowed in the messages array. Collect any system messages
-    # from history (e.g. the task seeded by launch-sandbox.sh) and merge them
-    # into the system prompt.
+    # Anthropic requires system content as a top-level parameter, not in the messages array.
+    # Collect system-role messages from history and merge them into the system prompt.
     all_messages = list(history) + list(new_messages)
 
     system_parts = [SYSTEM_PROMPT]
@@ -82,7 +71,6 @@ async def invoke_llm(
         "content": response.content[0].text,
     }
 
-    # Anthropic reports input and output tokens separately
     tokens_used = response.usage.input_tokens + response.usage.output_tokens
 
     return {

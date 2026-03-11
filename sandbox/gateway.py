@@ -1,14 +1,9 @@
 """
-Gateway Protocol — the sandbox's interface to the outside world.
+Gateway — the sandbox's interface to the control plane.
 
-Mirrors the article's Gateway pattern:
-    class AgentGateway(Protocol):
-        async def invoke_llm(...) -> LLMResponse
-        async def persist_messages(...) -> None
-
-The sandbox only knows about this interface. In production, it sends HTTP
-to the control plane. For local testing, you could swap in a DirectGateway
-that calls Ollama directly. The agent code doesn't change.
+All outbound calls (LLM, storage, message persistence) go through this
+client. Swapping in a different implementation (e.g. a direct Ollama
+gateway for testing) requires no changes to the agent.
 """
 
 import httpx
@@ -18,20 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 class ControlPlaneGateway:
-    """
-    Production gateway: all requests go through the control plane via HTTP.
-    The sandbox has no direct access to LLMs, storage, or any external service.
-    """
+    """Routes all sandbox requests through the control plane via HTTP."""
 
     def __init__(self, control_plane_url: str, session_token: str):
         self.base_url = control_plane_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {session_token}"}
 
     async def invoke_llm(self, new_messages: list[dict], model: str = None) -> dict:
-        """
-        Send new messages to the LLM via the control plane.
-        The control plane reconstructs full history and forwards to Ollama.
-        """
+        """Send new messages to the LLM. The control plane prepends conversation history."""
         payload = {"new_messages": new_messages}
         if model:
             payload["model"] = model

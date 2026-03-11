@@ -1,12 +1,5 @@
 """
-File Storage — presigned URL generation via MinIO.
-
-The sandbox never sees storage credentials. Instead:
-1. Sandbox asks control plane: "I need to upload foo.txt"
-2. Control plane generates a presigned S3 URL (scoped to this session)
-3. Sandbox uploads directly to MinIO using that URL
-
-Same pattern for downloads.
+Presigned URL generation for MinIO/S3 file storage.
 """
 
 import os
@@ -23,9 +16,7 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "agent-workspaces")
 
-# Presigned URLs need the externally-reachable MinIO address.
-# Inside Docker network, services talk to "minio:9000", but presigned URLs
-# are consumed by the sandbox which is also on the Docker network.
+# Presigned URLs must use the endpoint reachable by the URL consumer (sandbox containers).
 MINIO_PRESIGN_ENDPOINT = os.getenv("MINIO_PRESIGN_ENDPOINT", f"http://{MINIO_ENDPOINT}")
 
 
@@ -42,10 +33,7 @@ def get_s3_client():
 
 
 def get_presign_client():
-    """
-    Separate client for generating presigned URLs.
-    Uses the endpoint reachable by the sandbox container.
-    """
+    """S3 client configured with the endpoint embedded in presigned URLs."""
     return boto3.client(
         "s3",
         endpoint_url=MINIO_PRESIGN_ENDPOINT,
@@ -98,7 +86,6 @@ def list_session_files(session_id: str) -> list[str]:
         response = client.list_objects_v2(Bucket=MINIO_BUCKET, Prefix=prefix)
         files = []
         for obj in response.get("Contents", []):
-            # Strip the session prefix
             path = obj["Key"][len(prefix):]
             files.append({
                 "path": path,
