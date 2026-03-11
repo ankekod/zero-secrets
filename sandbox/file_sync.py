@@ -14,6 +14,7 @@ Flow:
 import os
 import hashlib
 import logging
+import mimetypes
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -65,11 +66,14 @@ class FileSync:
         for file_path, url_info in zip(changed, urls):
             full_path = os.path.join(WORKSPACE_DIR, file_path)
             try:
+                content_type, _ = mimetypes.guess_type(file_path)
+                content_type = content_type or "application/octet-stream"
                 with open(full_path, "rb") as f:
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         resp = await client.put(
                             url_info["url"],
                             content=f.read(),
+                            headers={"Content-Type": content_type},
                         )
                         resp.raise_for_status()
                 synced.append(file_path)
