@@ -1,30 +1,27 @@
 #!/bin/bash
-# Spawns a sandbox agent container for a given task.
+# Spawns a sandbox container with code-server (VS Code) + opencode.
 #
 # Usage:
-#   ./launch-sandbox.sh "Write a poem about clouds"
-#   ./launch-sandbox.sh --resume <session-id>
-
+#   ./launch-sandbox.sh                       # unlabeled session
+#   ./launch-sandbox.sh "Refactor parser"     # label the session
+#   ./launch-sandbox.sh --port 8444 "..."     # use a different host port
+#
+# Only one sandbox can use port 8443 at a time. For parallel sandboxes,
+# pass --port to map each container's 8443 to a different host port.
 set -e
 
 CONTROL_PLANE_URL="http://control-plane:8080"
 CONTROL_PLANE_HOST_URL="http://localhost:8080"
 NETWORK="agent-sandbox-demo_agent-network"
 IMAGE_NAME="sandbox-agent"
-
-RESUME_SESSION=""
+HOST_PORT=8443
 TASK=""
-FOLLOW=true
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --resume)
-            RESUME_SESSION="$2"
+        --port)
+            HOST_PORT="$2"
             shift 2
-            ;;
-        --no-follow)
-            FOLLOW=false
-            shift
             ;;
         *)
             TASK="$1"
@@ -33,58 +30,51 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-docker build -t "$IMAGE_NAME" ./sandbox/ -q
-
-if [ -n "$RESUME_SESSION" ]; then
-    SESSION_DATA=$(curl -s "$CONTROL_PLANE_HOST_URL/sessions/$RESUME_SESSION")
-    if echo "$SESSION_DATA" | grep -q "not found"; then
-        echo "Session $RESUME_SESSION not found"
-        exit 1
-    fi
-
-    # Token retrieval for resume is not implemented — tokens are not persisted.
-    echo "Resume not supported: session token is not stored between runs."
-    exit 1
-else
-    if [ -z "$TASK" ]; then
-        echo "Usage: ./launch-sandbox.sh \"Your task here\""
-        echo "       ./launch-sandbox.sh --resume <session-id>"
-        exit 1
-    fi
-
-    SESSION_RESPONSE=$(curl -s -X POST "$CONTROL_PLANE_HOST_URL/sessions" \
-        -H "Content-Type: application/json" \
-        -d "{\"task\": \"$TASK\"}")
-
-    SESSION_ID=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
-    TOKEN=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-
-    echo "Session: $SESSION_ID"
+if [ -z "$TASK" ]; then
+    TASK="Interactive coding session"
 fi
 
-# Seed the task as the first message in conversation history
-curl -s -X POST "$CONTROL_PLANE_HOST_URL/messages/persist" \
+docker build -t "$IMAGE_NAME" ./sandbox/ -q
+
+SESSION_RESPONSE=$(curl -s -X POST "$CONTROL_PLANE_HOST_URL/sessions" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" \
-    -d "{\"messages\": [{\"role\": \"system\", \"content\": \"The user's task is: $TASK\"}]}" > /dev/null
+    -d "{\"task\": \"$TASK\"}")
+
+SESSION_ID=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['session_id'])")
+TOKEN=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
 CONTAINER_ID=$(docker run -d \
     --name "sandbox-${SESSION_ID}" \
     --network "$NETWORK" \
+    -p "${HOST_PORT}:8443" \
     -e "SESSION_TOKEN=$TOKEN" \
     -e "CONTROL_PLANE_URL=$CONTROL_PLANE_URL" \
     -e "SESSION_ID=$SESSION_ID" \
     "$IMAGE_NAME")
 
 SHORT_ID="${CONTAINER_ID:0:12}"
-echo "Container: $SHORT_ID (sandbox-${SESSION_ID})"
-echo ""
-echo "  Logs:    docker logs -f sandbox-${SESSION_ID}"
-echo "  Exec:    docker exec -it sandbox-${SESSION_ID} bash"
-echo "  Session: curl localhost:8080/sessions/${SESSION_ID}"
-echo "  Files:   http://localhost:9001"
-echo ""
 
-if [ "$FOLLOW" = true ]; then
-    docker logs -f "sandbox-${SESSION_ID}"
-fi
+# Wait for code-server to start accepting connections.
+printf "  Waiting for code-server"
+for _ in $(seq 1 30); do
+    if curl -sf --max-time 1 -o /dev/null "http://localhost:${HOST_PORT}/" 2>/dev/null; then
+        printf " ready\n"
+        break
+    fi
+    printf "."
+    sleep 1
+done
+
+cat <<EOF
+
+  Session:   $SESSION_ID
+  Container: $SHORT_ID
+
+  → Open VS Code:  http://localhost:${HOST_PORT}
+
+  Logs:    docker logs -f sandbox-${SESSION_ID}
+  Exec:    docker exec -it --user sandbox sandbox-${SESSION_ID} bash
+  Audit:   curl localhost:8080/sessions/${SESSION_ID}
+  Stop:    docker stop sandbox-${SESSION_ID}
+
+EOF

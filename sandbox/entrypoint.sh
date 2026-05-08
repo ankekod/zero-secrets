@@ -1,25 +1,24 @@
 #!/bin/bash
-# Reads session credentials from environment into memory, strips them from
-# the environment, drops root privileges, then runs the agent.
-
+# Runs as root. Reads the session credentials from the environment into
+# memory, strips them, then drops privileges and hands off to start-services.sh.
+# After this script execs, the sandbox process tree contains no env vars
+# referencing the session token — `docker exec sandbox env` is empty of secrets.
 set -e
 
-# Write env vars to a temp file, then unset them so the environment is clean
-TEMP_CONFIG=$(mktemp)
-echo "SESSION_TOKEN=${SESSION_TOKEN}" >> "$TEMP_CONFIG"
-echo "CONTROL_PLANE_URL=${CONTROL_PLANE_URL}" >> "$TEMP_CONFIG"
-echo "SESSION_ID=${SESSION_ID}" >> "$TEMP_CONFIG"
+TEMP=$(mktemp)
+echo "SESSION_TOKEN=${SESSION_TOKEN}" >> "$TEMP"
+echo "CONTROL_PLANE_URL=${CONTROL_PLANE_URL}" >> "$TEMP"
+echo "SESSION_ID=${SESSION_ID}" >> "$TEMP"
 
-unset SESSION_TOKEN
-unset CONTROL_PLANE_URL
-unset SESSION_ID
+unset SESSION_TOKEN CONTROL_PLANE_URL SESSION_ID
 
-TOKEN=$(grep SESSION_TOKEN "$TEMP_CONFIG" | cut -d= -f2)
-CP_URL=$(grep CONTROL_PLANE_URL "$TEMP_CONFIG" | cut -d= -f2)
-SID=$(grep SESSION_ID "$TEMP_CONFIG" | cut -d= -f2)
+TOKEN=$(grep '^SESSION_TOKEN=' "$TEMP" | cut -d= -f2-)
+CP_URL=$(grep '^CONTROL_PLANE_URL=' "$TEMP" | cut -d= -f2-)
+SID=$(grep '^SESSION_ID=' "$TEMP" | cut -d= -f2-)
+rm -f "$TEMP"
 
-rm -f "$TEMP_CONFIG"
+echo "[entrypoint] session=$SID control-plane=$CP_URL"
 
-echo "Starting sandbox agent (session: $SID, control-plane: $CP_URL)"
-
-exec su sandbox -c "python /app/agent.py --token '$TOKEN' --control-plane '$CP_URL' --session '$SID'"
+# Credentials are passed as positional args (not env vars) so they don't
+# survive into the child process's environment.
+exec su sandbox -c "/app/start-services.sh '$TOKEN' '$CP_URL' '$SID'"

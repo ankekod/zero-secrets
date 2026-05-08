@@ -1,73 +1,124 @@
 """
-Syncs /workspace files to S3 via presigned upload URLs obtained from the control plane.
+Continuously syncs /workspace to S3 via presigned URLs from the control plane.
+
+Runs as a background process inside the sandbox. The agent itself doesn't
+need to know about persistence — file_sync watches the workspace and uploads
+anything that changes. The control plane mints the URLs; storage credentials
+never enter the sandbox.
 """
 
-import os
+import argparse
+import asyncio
 import hashlib
 import logging
 import mimetypes
+import os
+import signal
+import sys
+
 import httpx
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [file_sync] %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 WORKSPACE_DIR = "/workspace"
+SCAN_INTERVAL_SECONDS = 3
 
 
-class FileSync:
-    def __init__(self, gateway):
-        self.gateway = gateway
-        self._file_hashes: dict[str, str] = {}
+def hash_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    def _hash_file(self, path: str) -> str:
-        """Get MD5 hash of a file to detect changes."""
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
 
-    def detect_changes(self) -> list[str]:
-        """Scan /workspace for new or modified files."""
-        changed = []
-        for root, dirs, files in os.walk(WORKSPACE_DIR):
-            for fname in files:
-                full_path = os.path.join(root, fname)
-                rel_path = os.path.relpath(full_path, WORKSPACE_DIR)
-
-                current_hash = self._hash_file(full_path)
-                if self._file_hashes.get(rel_path) != current_hash:
-                    changed.append(rel_path)
-                    self._file_hashes[rel_path] = current_hash
-
-        return changed
-
-    async def sync(self) -> list[str]:
-        """Sync changed files to S3 via presigned URLs."""
-        changed = self.detect_changes()
-        if not changed:
-            return []
-
-        logger.info(f"Syncing {len(changed)} changed file(s): {changed}")
-
-        urls = await self.gateway.get_upload_urls(changed)
-
-        synced = []
-        for file_path, url_info in zip(changed, urls):
-            full_path = os.path.join(WORKSPACE_DIR, file_path)
+def detect_changes(seen: dict[str, str]) -> list[str]:
+    changed = []
+    for root, _dirs, files in os.walk(WORKSPACE_DIR):
+        for fname in files:
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, WORKSPACE_DIR)
             try:
-                content_type, _ = mimetypes.guess_type(file_path)
-                content_type = content_type or "application/octet-stream"
-                with open(full_path, "rb") as f:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.put(
-                            url_info["url"],
-                            content=f.read(),
-                            headers={"Content-Type": content_type},
-                        )
-                        resp.raise_for_status()
-                synced.append(file_path)
-                logger.info(f"Uploaded {file_path} via presigned URL")
-            except Exception as e:
-                logger.error(f"Failed to upload {file_path}: {e}")
+                h = hash_file(full)
+            except OSError:
+                continue
+            if seen.get(rel) != h:
+                changed.append(rel)
+                seen[rel] = h
+    return changed
 
-        return synced
+
+async def get_upload_urls(
+    client: httpx.AsyncClient, base: str, headers: dict, paths: list[str]
+) -> list[dict]:
+    resp = await client.post(
+        f"{base}/files/presigned-urls",
+        json={"paths": paths, "action": "upload"},
+        headers=headers,
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["urls"]
+
+
+async def upload(client: httpx.AsyncClient, url: str, path: str) -> None:
+    full = os.path.join(WORKSPACE_DIR, path)
+    content_type, _ = mimetypes.guess_type(path)
+    content_type = content_type or "application/octet-stream"
+    with open(full, "rb") as f:
+        body = f.read()
+    resp = await client.put(
+        url, content=body, headers={"Content-Type": content_type}, timeout=30.0
+    )
+    resp.raise_for_status()
+
+
+async def run(token: str, control_plane: str) -> None:
+    base = control_plane.rstrip("/")
+    headers = {"Authorization": f"Bearer {token}"}
+    seen: dict[str, str] = {}
+
+    logger.info("watching %s (interval %ds)", WORKSPACE_DIR, SCAN_INTERVAL_SECONDS)
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                changed = detect_changes(seen)
+                if changed:
+                    logger.info("syncing %d file(s): %s", len(changed), changed)
+                    urls = await get_upload_urls(client, base, headers, changed)
+                    for path, url_info in zip(changed, urls):
+                        try:
+                            await upload(client, url_info["url"], path)
+                            logger.info("  uploaded %s", path)
+                        except Exception as e:
+                            logger.warning("  failed %s: %s", path, e)
+            except Exception as e:
+                logger.warning("scan loop error: %s", e)
+
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token", required=True)
+    parser.add_argument("--control-plane", required=True)
+    parser.add_argument("--session", required=True)
+    args = parser.parse_args()
+
+    loop = asyncio.new_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: sys.exit(0))
+    try:
+        loop.run_until_complete(run(args.token, args.control_plane))
+    except SystemExit:
+        pass
+
+
+if __name__ == "__main__":
+    main()
