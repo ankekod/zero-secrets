@@ -1,6 +1,9 @@
 services:
   # ===========================================
-  # Control Plane - holds all secrets, proxies everything
+  # Control plane - holds all secrets, proxies everything.
+  # Joins both networks: agent-network (sandbox-facing) and cp-internal
+  # (control-plane-and-sidecars). It's the only service on cp-internal that
+  # the sandbox can transitively reach.
   # ===========================================
   control-plane:
     build: ./control-plane
@@ -8,20 +11,47 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # The only service that ever sees the Anthropic API key.
-      # The sandbox never receives this — that's the whole point.
+      # The only services that ever see the Anthropic API key or the GitHub
+      # PAT. The sandbox never receives either — that's the whole point.
+      # The control plane injects each credential on outbound calls
+      # (Anthropic for /v1/messages, GitHub for /mcp/github proxy).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GITHUB_PAT=${GITHUB_PAT:-}
+      # The github-mcp sidecar that the control plane proxies to. Unset →
+      # /mcp/github returns 503.
+      - GITHUB_MCP_UPSTREAM=${GITHUB_MCP_UPSTREAM:-http://github-mcp:8090}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
       - MINIO_BUCKET=agent-workspaces
     networks:
       - agent-network
+      - cp-internal
     depends_on:
       - minio
 
   # ===========================================
-  # MinIO - S3-compatible storage (replaces AWS S3)
+  # GitHub MCP sidecar.
+  # Wraps GitHub's official stdio-only MCP server with mcp-proxy so the
+  # control plane can reach it over HTTP/SSE. Lives on cp-internal only —
+  # the sandbox cannot route to it directly even if it tried; the control
+  # plane is the sole bridge.
+  # ===========================================
+  github-mcp:
+    build: ./github-mcp
+    container_name: github-mcp
+    # No GITHUB_PERSONAL_ACCESS_TOKEN here — in HTTP mode, github-mcp-server
+    # is multi-tenant and authenticates each request via the Authorization
+    # header. The control plane injects the real PAT on each forwarded call,
+    # so the credential lives ONLY in the control-plane container.
+    networks:
+      - cp-internal
+    restart: unless-stopped
+
+  # ===========================================
+  # MinIO - S3-compatible storage (replaces AWS S3).
+  # On agent-network because the sandbox uploads directly via presigned URLs
+  # minted by the control plane.
   # ===========================================
   minio:
     image: minio/minio:latest
@@ -60,7 +90,12 @@ services:
       - agent-network
 
 networks:
+  # Sandbox-facing network. Sandbox containers attach here at launch time.
   agent-network:
+    driver: bridge
+  # Control-plane-only network. Sidecars (github-mcp, future MCPs) attach
+  # here so the sandbox cannot route to them directly.
+  cp-internal:
     driver: bridge
 
 volumes:

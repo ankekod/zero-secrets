@@ -14,8 +14,9 @@ import json
 import logging
 import os
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from sessions import Session, SessionStore
@@ -31,6 +32,9 @@ from file_storage import (
     list_session_files,
 )
 
+GITHUB_MCP_UPSTREAM = os.getenv("GITHUB_MCP_UPSTREAM", "").rstrip("/")
+GITHUB_PAT = os.getenv("GITHUB_PAT", "")
+
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
@@ -39,8 +43,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("control-plane")
 
-app = FastAPI(title="Agent Control Plane", version="0.2.0")
+app = FastAPI(title="Agent Control Plane", version="0.3.0")
 store = SessionStore()
+
+
+@app.middleware("http")
+async def mcp_auth(request: Request, call_next):
+    """
+    All /mcp/* routes (mounted MCP servers) must carry a valid session token
+    as `Authorization: Bearer <token>`. We validate here once, before routing
+    into the mounted Starlette apps, since FastAPI's Depends() doesn't reach
+    inside ASGI mounts.
+    """
+    if request.url.path.startswith("/mcp/"):
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse({"error": "missing bearer token"}, status_code=401)
+        session = store.get_by_token(auth[len("Bearer "):])
+        if session is None or not session.active:
+            return JSONResponse({"error": "invalid or inactive session"}, status_code=401)
+        # Tag the request so tools/handlers can see who called.
+        request.scope["session_id"] = session.session_id
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -51,6 +75,77 @@ async def startup_check():
         logger.info(f"Anthropic API ready. Default model: {health['default_model']}")
     else:
         logger.warning(f"LLM not configured: {health.get('error')}")
+    if GITHUB_MCP_UPSTREAM:
+        logger.info("GitHub MCP proxy → %s (mounted at /mcp/github)", GITHUB_MCP_UPSTREAM)
+    else:
+        logger.warning("GitHub MCP proxy NOT mounted (GITHUB_MCP_UPSTREAM unset)")
+
+
+# ─── GitHub MCP proxy ───────────────────────────────────────────
+# Transparent HTTP proxy to the github-mcp sidecar, which runs GitHub's
+# official github-mcp-server in HTTP/Streamable-HTTP mode.
+#
+# The sandbox connects to /mcp/github/mcp; we strip the session token
+# (already validated by the mcp_auth middleware), forward to the sidecar,
+# and stream the response back. The GITHUB_PAT never reaches the sandbox.
+
+# host is per-hop. authorization is our session token, not the GitHub PAT.
+# content-length will be re-set by httpx based on the body we hand it.
+_DROP_REQUEST_HEADERS = {"host", "authorization", "content-length"}
+
+# Headers we drop from the upstream response — letting these through
+# breaks Starlette's framing of the streamed response.
+_DROP_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "content-encoding", "connection"}
+
+
+@app.api_route("/mcp/github/{path:path}", methods=["GET", "POST", "DELETE"])
+async def proxy_github_mcp(request: Request, path: str):
+    if not GITHUB_MCP_UPSTREAM:
+        raise HTTPException(503, "GitHub MCP proxy not configured")
+
+    upstream_url = f"{GITHUB_MCP_UPSTREAM}/{path}"
+    if request.url.query:
+        upstream_url += f"?{request.url.query}"
+
+    body = await request.body()
+    headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in _DROP_REQUEST_HEADERS
+    }
+    # Inject the real GitHub PAT. github-mcp-server's HTTP mode is multi-
+    # tenant and requires an Authorization header on every request; we
+    # strip the sandbox's session token (above) and substitute the PAT
+    # held in the control-plane env. The sandbox never sees the PAT.
+    if GITHUB_PAT:
+        headers["authorization"] = f"Bearer {GITHUB_PAT}"
+
+    logger.debug("[mcp/github] %s %s → %s", request.method, request.url.path, upstream_url)
+
+    client = httpx.AsyncClient(timeout=None)
+    upstream_req = client.build_request(
+        request.method,
+        upstream_url,
+        headers=headers,
+        content=body if body else None,
+    )
+    upstream_resp = await client.send(upstream_req, stream=True)
+
+    async def relay():
+        try:
+            async for chunk in upstream_resp.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        relay(),
+        status_code=upstream_resp.status_code,
+        headers={
+            k: v for k, v in upstream_resp.headers.items()
+            if k.lower() not in _DROP_RESPONSE_HEADERS
+        },
+        media_type=upstream_resp.headers.get("content-type"),
+    )
 
 
 # ─── Auth ───────────────────────────────────────────────────────
