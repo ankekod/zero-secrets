@@ -104,9 +104,10 @@ Two networks make it physical: the sandbox is on `agent-network` only; the githu
 ├── github-mcp/
 │   └── Dockerfile              downloads github-mcp-server binary, runs `http` mode
 └── sandbox/
-    ├── Dockerfile              code-server + opencode + python + /usr/local/bin/git shim
+    ├── Dockerfile              code-server + opencode + python + git + git wrapper
     ├── entrypoint.sh           env strip + privilege drop
     ├── start-services.sh       opencode config, AGENTS.md, file_sync bg, code-server fg
+    ├── git-shim.sh             wrapper that blocks network-touching git subcommands
     ├── requirements.txt
     └── file_sync.py            standalone workspace → MinIO uploader
 ```
@@ -115,7 +116,7 @@ Two networks make it physical: the sandbox is on `agent-network` only; the githu
 
 These are part of the demo story — be careful not to accidentally add them back:
 
-- **`git`** — there's a shim at `/usr/local/bin/git` that exits 127 with a message pointing the agent at the github MCP tools. The agent's git workflow goes through `push_files` etc., not shell git.
+- **Network-touching `git` operations** — `git` itself is installed and used freely for local work (log/diff/status/branch/checkout/commit/merge/rebase/blame). A wrapper at `/usr/local/bin/git` (earlier on PATH than `/usr/bin/git`) intercepts the subcommands that would talk to github.com — `push`, `pull`, `fetch`, `clone`, `ls-remote` — and points the agent at the github MCP server. The wrapper isn't the security boundary (the network is); it's a clear signpost so the agent doesn't waste turns hitting timeouts. The agent's *remote* git workflow still goes through `push_files` / `create_pull_request` / etc.
 - **Internet egress** — the sandbox is on `agent-network` only; nothing on that network can reach anything outside the docker host. Public DNS works (docker's resolver) but no outbound TCP.
 - **Real credentials in env** — `ANTHROPIC_API_KEY`, `GITHUB_PAT`, MinIO creds never reach the sandbox. The session token (sent as the "API key" to opencode's view of Anthropic) is session-scoped and useless outside this session.
 

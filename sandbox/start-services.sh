@@ -50,10 +50,24 @@ provided, not by reaching for the usual shell commands.
 
 ## What is NOT available
 
-- \`git\`, \`gh\`, or any other VCS client — there is no local git binary
 - direct internet access (curl/wget/pip-install will fail to reach anything
   other than the control plane)
 - API keys, cloud credentials, or database connection strings
+- network-touching \`git\` subcommands (\`push\`, \`pull\`, \`fetch\`, \`clone\`,
+  \`ls-remote\`) — use the \`github\` MCP server for anything that talks to
+  GitHub
+
+## Working with git locally
+
+\`git\` is installed and works normally for all local operations: \`log\`,
+\`diff\`, \`status\`, \`branch\`, \`checkout\`, \`commit\`, \`merge\`, \`rebase\`,
+\`blame\`, etc. Use it freely to read history, manage branches, and resolve
+conflicts.
+
+\`/workspace\` starts empty. To bring repo contents in, use the \`github\` MCP
+server (\`get_file_contents\` and friends). To send local commits back to
+GitHub, use \`push_files\` / \`create_or_update_file\` / \`create_pull_request\`
+— see below.
 
 ## Committing to GitHub — use the \`github\` MCP server
 
@@ -91,9 +105,9 @@ object storage automatically — you do not need to "save", "upload", or
 "sync" anything by hand.
 AGENTS
 
-# NOTE: the `git` shim that nudges the model toward git_commit lives at
-# /usr/local/bin/git — installed system-wide in the Dockerfile so that
-# non-interactive bash subprocesses (opencode's bash tool) find it on PATH.
+# NOTE: the `git` wrapper at /usr/local/bin/git intercepts network-touching
+# subcommands (push/pull/fetch/clone/ls-remote) and points the agent at the
+# github MCP server. Local git operations pass through to /usr/bin/git.
 
 # Put the env vars in ~/.bashrc rather than exporting them here.
 #
