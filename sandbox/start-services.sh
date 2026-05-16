@@ -64,10 +64,24 @@ provided, not by reaching for the usual shell commands.
 \`blame\`, etc. Use it freely to read history, manage branches, and resolve
 conflicts.
 
-\`/workspace\` starts empty. To bring repo contents in, use the \`github\` MCP
-server (\`get_file_contents\` and friends). To send local commits back to
-GitHub, use \`push_files\` / \`create_or_update_file\` / \`create_pull_request\`
-— see below.
+\`/workspace\` starts empty. To pull the project repo in, use the
+\`sandbox-clone\` helper — it asks the control plane to do a real
+\`git clone\` server-side (using the PAT) and streams the working tree
+(including \`.git/\`) back to you:
+
+    sandbox-clone                       # ${GITHUB_REPO_INFO}
+    sandbox-clone owner/repo            # any other repo
+    sandbox-clone owner/repo some-branch
+
+You get the full upstream git history — \`log\`, \`diff\`, \`branch\`,
+\`checkout\`, \`merge\` all work against real commits. \`origin\` is set to
+the github.com URL but cannot be fetched from directly (no network).
+
+For piecemeal reads without a clone, the \`github\` MCP server's
+\`get_file_contents\` works too.
+
+To send local commits back to GitHub, use \`push_files\` /
+\`create_or_update_file\` / \`create_pull_request\` — see below.
 
 ## Committing to GitHub — use the \`github\` MCP server
 
@@ -124,6 +138,12 @@ cat >> "$HOME/.bashrc" <<EOF
 # === sandbox demo: opencode → control plane ===
 export ANTHROPIC_API_KEY="${TOKEN}"
 export ANTHROPIC_BASE_URL="${CP_URL}"
+
+# Used by sandbox-clone and any other broker-mediated helpers. Same session
+# token as above; this just gives it a clearer name for scripts that aren't
+# pretending to be the Anthropic API.
+export SESSION_TOKEN="${TOKEN}"
+export CONTROL_PLANE_URL="${CP_URL}"
 EOF
 
 # Background: continuously sync /workspace to MinIO via presigned URLs.

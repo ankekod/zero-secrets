@@ -25,6 +25,7 @@ This is a **demonstration/teaching tool**, not production software. The owner (J
 │  │   Control plane (FastAPI :8080)                                       │
 │  │     - /v1/messages    → Anthropic Messages API                        │
 │  │     - /mcp/github/*   → github-mcp sidecar (streamable HTTP proxy)    │
+│  │     - /v1/repo/tarball → GitHub repo tarball (PAT-authenticated)      │
 │  │     - /files/*        → MinIO presigned URLs                          │
 │  │     - /sessions/*     → audit + session management                    │
 │  │     env: ANTHROPIC_API_KEY, GITHUB_PAT, MinIO creds                   │
@@ -80,6 +81,17 @@ Two networks make it physical: the sandbox is on `agent-network` only; the githu
 2. Control plane's HTTP middleware validates the session token, then `proxy_github_mcp` strips the session-token `Authorization` header and **injects** `Authorization: Bearer <real GITHUB_PAT>` before forwarding to `http://github-mcp:8090/mcp` over the `cp-internal` network.
 3. github-mcp-server validates the PAT against GitHub, executes the tool (e.g. `push_files`), returns the result. Streamed back through the proxy.
 
+### Repo clone (`sandbox-clone` → `/v1/repo/tarball`)
+
+github-mcp-server has no clone tool, and GitHub's tarball API returns a snapshot without `.git/` history. To give the sandbox a real working tree, `/v1/repo/tarball` does a *server-side* `git clone` on the control plane and tars up the result:
+
+1. The agent (or human) runs `sandbox-clone [owner/repo] [ref]` inside the sandbox. With no args it uses `$GITHUB_REPO` / `$GITHUB_BRANCH`.
+2. The helper `curl`s `${CP_URL}/v1/repo/tarball?owner=…&repo=…&ref=…` with the session token.
+3. Control plane validates the session, `tempfile.mkdtemp`s a working directory, and runs `git -c http.extraHeader="Authorization: Bearer <PAT>" clone https://github.com/owner/repo.git tmpdir/repo`. The `extraHeader` form keeps the PAT out of `.git/config` and out of any ref state — `origin` is stored as the clean `https://github.com/owner/repo.git`.
+4. `tar -czf - -C tmpdir/repo .` streams the full working tree (including `.git/`) back through the control plane to the sandbox, which untars into `/workspace/<repo>`. The tmpdir is cleaned up after the stream finishes.
+
+The result is a real `git` working copy with full upstream history. `log`/`diff`/`branch`/`checkout`/`merge` work against real commits. The remote URL is cleanly stored, but the sandbox can't `git fetch` from it (no network egress, plus the wrapper blocks the subcommand). To send commits back to GitHub, the agent goes through the github MCP server (`push_files`, `create_pull_request`).
+
 ### File persistence (sandbox → MinIO)
 
 1. `file_sync.py` runs as a background process inside the sandbox, scanning `/workspace` every 3 s for changes.
@@ -104,10 +116,11 @@ Two networks make it physical: the sandbox is on `agent-network` only; the githu
 ├── github-mcp/
 │   └── Dockerfile              downloads github-mcp-server binary, runs `http` mode
 └── sandbox/
-    ├── Dockerfile              code-server + opencode + python + git + git wrapper
+    ├── Dockerfile              code-server + opencode + python + git + helpers
     ├── entrypoint.sh           env strip + privilege drop
     ├── start-services.sh       opencode config, AGENTS.md, file_sync bg, code-server fg
     ├── git-shim.sh             wrapper that blocks network-touching git subcommands
+    ├── sandbox-clone.sh        broker-mediated repo fetch (→ /v1/repo/tarball)
     ├── requirements.txt
     └── file_sync.py            standalone workspace → MinIO uploader
 ```

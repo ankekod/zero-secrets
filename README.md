@@ -149,11 +149,12 @@ The full session audit: every LLM call (model, message count, snippet of the las
 │   └── Dockerfile              # github-mcp-server v1.0.3 in HTTP mode
 │
 └── sandbox/                    # Image launched per session
-    ├── Dockerfile              # code-server + opencode + python + git + git wrapper
+    ├── Dockerfile              # code-server + opencode + python + git + helpers
     ├── entrypoint.sh           # Reads session env, strips, drops privileges
     ├── start-services.sh       # Templates opencode config + AGENTS.md;
     │                           #   starts file_sync, runs code-server
     ├── git-shim.sh             # Wrapper: blocks push/pull/fetch/clone, exec's local git
+    ├── sandbox-clone.sh        # Broker-mediated repo fetch (→ /v1/repo/tarball)
     ├── requirements.txt
     └── file_sync.py            # Background workspace → MinIO uploader
 ```

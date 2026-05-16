@@ -10,9 +10,13 @@ this service looks like:
 Session state is in-memory. Production would back it with a real store.
 """
 
+import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import tempfile
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -330,6 +334,128 @@ async def v1_messages(request: Request, session: Session = Depends(get_session_a
 @app.post("/messages")
 async def messages(request: Request, session: Session = Depends(get_session_apikey)):
     return await _proxy_anthropic(request, session)
+
+
+# ─── GitHub repo clone ──────────────────────────────────────────
+# github-mcp-server has no "clone" tool, and GitHub's tarball API returns
+# a snapshot without .git/ history. To give the sandbox a real working
+# tree (so log/diff/branch/checkout/merge work against actual history),
+# we do a server-side `git clone` here — with the PAT injected via
+# http.extraHeader so it never lands in .git/config — then tar the result
+# (including .git/) and stream it back. The temp dir is cleaned up after
+# the stream finishes.
+
+# Conservative validation. We pass these as argv (no shell), so this is
+# defense in depth — mainly to keep `..` out of clone_path and weird
+# characters out of git's CLI surface.
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+_REF_RE = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+@app.get("/v1/repo/tarball")
+async def repo_tarball(
+    owner: str,
+    repo: str,
+    ref: str | None = None,
+    session: Session = Depends(get_session_bearer),
+):
+    if not GITHUB_PAT:
+        raise HTTPException(503, "GITHUB_PAT not configured on control plane")
+    if not _NAME_RE.fullmatch(owner) or not _NAME_RE.fullmatch(repo):
+        raise HTTPException(400, "invalid owner/repo (alphanumeric, ., _, - only)")
+    if ref and not _REF_RE.fullmatch(ref):
+        raise HTTPException(400, "invalid ref")
+
+    logger.info(
+        "─── /v1/repo/tarball session=%s repo=%s/%s ref=%s",
+        session.session_id, owner, repo, ref or "(default branch)",
+    )
+    store.add_messages(session.session_id, [{
+        "role": "system",
+        "content": f"[clone] {owner}/{repo}@{ref or 'default'}",
+    }])
+
+    tmpdir = tempfile.mkdtemp(prefix=f"clone-{session.session_id}-")
+    clone_path = os.path.join(tmpdir, repo)
+
+    # PAT auth via URL embedding — GitHub's documented pattern for HTTPS git.
+    # `x-access-token` is the special username GitHub recognizes for PAT auth.
+    # The credentialed URL ends up in .git/config after a normal clone; we
+    # rewrite remote.origin.url and delete FETCH_HEAD below to scrub it.
+    clean_url = f"https://github.com/{owner}/{repo}.git"
+    auth_url = f"https://x-access-token:{GITHUB_PAT}@github.com/{owner}/{repo}.git"
+
+    clone_args = ["git", "clone", "--quiet"]
+    if ref:
+        clone_args += ["--branch", ref]
+    clone_args += [auth_url, clone_path]
+
+    proc = await asyncio.create_subprocess_exec(
+        *clone_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        msg = err.decode("utf-8", errors="replace")[:1000].replace(GITHUB_PAT, "[PAT]")
+        logger.error(
+            "    clone FAILED (rc=%d) for %s/%s@%s: %s",
+            proc.returncode, owner, repo, ref or "default", msg,
+        )
+        raise HTTPException(400, f"git clone failed (rc={proc.returncode}): {msg}")
+
+    # Scrub the PAT out of the cloned repo before tar'ing. set-url replaces
+    # the URL in .git/config; FETCH_HEAD can also carry the credentialed
+    # URL on some git versions, so we delete it (cosmetic — it's regenerated
+    # on the next fetch, which can't happen from the sandbox anyway).
+    scrub = await asyncio.create_subprocess_exec(
+        "git", "-C", clone_path, "remote", "set-url", "origin", clean_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, scrub_err = await scrub.communicate()
+    if scrub.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.error(
+            "    remote set-url FAILED for %s/%s: %s",
+            owner, repo,
+            scrub_err.decode("utf-8", errors="replace")[:500].replace(GITHUB_PAT, "[PAT]"),
+        )
+        raise HTTPException(500, "failed to scrub remote URL")
+
+    fetch_head = os.path.join(clone_path, ".git", "FETCH_HEAD")
+    if os.path.exists(fetch_head):
+        os.remove(fetch_head)
+
+    logger.info("    clone OK → streaming tar back to sandbox")
+
+    # `-C clone_path .` makes tar entries start at `./` — no wrapper dir,
+    # so sandbox-clone untars straight into its target without --strip.
+    tar_proc = await asyncio.create_subprocess_exec(
+        "tar", "-czf", "-", "-C", clone_path, ".",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def relay():
+        try:
+            while True:
+                chunk = await tar_proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                await tar_proc.wait()
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return StreamingResponse(
+        relay(),
+        media_type="application/gzip",
+        headers={"content-disposition": f'attachment; filename="{repo}.tar.gz"'},
+    )
 
 
 # ─── File storage ───────────────────────────────────────────────

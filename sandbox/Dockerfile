@@ -29,6 +29,13 @@ RUN useradd -m -s /bin/bash sandbox \
 COPY git-shim.sh /usr/local/bin/git
 RUN chmod +x /usr/local/bin/git
 
+# `sandbox-clone` — broker-mediated repo fetch. The github MCP server has
+# no clone tool, so this helper calls the control plane's /v1/repo/tarball
+# endpoint, pipes the gzipped archive through tar into /workspace, and runs
+# `git init` so local git works on the snapshot.
+COPY sandbox-clone.sh /usr/local/bin/sandbox-clone
+RUN chmod +x /usr/local/bin/sandbox-clone
+
 WORKDIR /app
 
 # Python deps for the file-sync background worker.
