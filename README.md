@@ -1,187 +1,198 @@
 # Agent Sandbox Demo
 
-A local demonstration of the **"Isolate the Agent"** pattern for secure AI agent infrastructure.
+A local demonstration of the **"Isolate the Agent"** pattern for AI agent infrastructure: a coding agent in VS Code runs inside a sandbox container with no credentials, and reaches the outside world *only* through a control plane that holds every secret.
 
-Based on the architecture described by [Larsen Cundric at Browser Use](https://x.com/larsencc/article/2027225210412470668).
+Inspired by Browser Use's [architecture write-up by Larsen Cundric](https://x.com/larsencc/article/2027225210412470668).
+
+## The core idea
+
+> "Your agent should have nothing worth stealing and nothing worth preserving."
+
+The sandbox container is given exactly three env vars at launch: `SESSION_TOKEN`, `CONTROL_PLANE_URL`, `SESSION_ID`. They're read into memory, stripped from `env`, then the process drops to a non-root user. From that moment on:
+
+- It has **no** Anthropic API key — yet the agent runs Claude.
+- It has **no** GitHub PAT — yet the agent commits to GitHub.
+- It has **no** S3 credentials — yet the agent persists files to object storage.
+- It has **no** network egress to the public internet — yet everything above works.
+
+Every external call is brokered by a separate control plane container that swaps the sandbox's session token for the real credential at the boundary.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                     Docker Network                        │
-│                                                           │
-│  ┌──────────┐    ┌───────────────┐    ┌────────────────┐  │
-│  │  Sandbox  │───▶│ Control Plane │───▶│ Anthropic API  │  │
-│  │  (Agent)  │    │   (FastAPI)   │    │(haiku-4-5)     │  │
-│  └──────────┘    └───────┬───────┘    └────────────────┘  │
-│       │                  │                                │
-│       │ presigned URLs   │ real credentials               │
-│       ▼                  ▼                                │
-│                   ┌─────────────┐                         │
-│                   │    MinIO    │                         │
-│                   │ (S3 storage)│                         │
-│                   └─────────────┘                         │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────── Docker host ─────────────────────────────────┐
+│                                                                          │
+│  ┌───── agent-network ───────────────────┐                               │
+│  │                                       │                               │
+│  │   Sandbox container (per session)     │                               │
+│  │   ┌─────────────────────────────────┐ │                               │
+│  │   │  code-server (browser VS Code)  │ │◀──── presenter's browser     │
+│  │   │   └─ terminal → opencode        │ │      http://localhost:8443   │
+│  │   │  file_sync.py (background)      │ │                               │
+│  │   └────────────┬────────────────────┘ │                               │
+│  │                │                       │                               │
+│  │                ▼ (only allowed egress) │                               │
+│  │   ┌──── Control plane (FastAPI) ────┐ │                               │
+│  │   │  /v1/messages   Anthropic proxy │ │── ANTHROPIC_API_KEY ──▶ Anthropic
+│  │   │  /mcp/github/*  GitHub MCP proxy│ │            │                  │
+│  │   │  /files/*       presigned URLs  │ │            │                  │
+│  │   │  /sessions/*    audit + auth    │ │            │                  │
+│  │   └────────┬─────────────────┬──────┘ │            │                  │
+│  │            │                 │        │            │                  │
+│  │            ▼                 │        │            │                  │
+│  │   ┌─── MinIO ─────┐          │        │            │                  │
+│  │   │ S3-compatible │          │        │            │                  │
+│  │   └───────────────┘          │        │            │                  │
+│  └──────────────────────────────┼────────┘            │                  │
+│                                 │                     │                  │
+│  ┌──── cp-internal network ─────┼─────────────┐       │                  │
+│  │   (sandbox CANNOT reach)     ▼             │       │                  │
+│  │                       ┌──── github-mcp ───┐│       │                  │
+│  │                       │ github-mcp-server ││── GITHUB_PAT ──▶ api.github.com
+│  │                       │ in HTTP mode      ││                          │
+│  │                       └───────────────────┘│                          │
+│  └────────────────────────────────────────────┘                          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Principle
-
-> "Your agent should have nothing worth stealing and nothing worth preserving."
-
-The sandbox container receives only 3 env vars: `SESSION_TOKEN`, `CONTROL_PLANE_URL`, `SESSION_ID`.
-No API keys, no cloud credentials, no database access. Everything goes through the control plane.
+Two network segments enforce the trust boundary: the **sandbox can route only to the control plane and MinIO**, never to GitHub's MCP sidecar or the public internet. The control plane is the sole bridge.
 
 ## Prerequisites
 
-- Docker & Docker Compose
-- An [Anthropic API key](https://console.anthropic.com/)
+- Docker / Docker Desktop (or Podman)
+- [An Anthropic API key](https://console.anthropic.com/)
+- A [fine-grained GitHub PAT](https://github.com/settings/personal-access-tokens) scoped to a single demo repo with **Contents: read & write** + **Metadata: read** permissions. (Make sure the repo's `main` branch doesn't have protection rules that block direct pushes — or point `GITHUB_BRANCH` at an unprotected branch.)
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Set your Anthropic API key
+# 1. Credentials (only the control plane will see these)
 export ANTHROPIC_API_KEY=sk-ant-...
+export GITHUB_PAT=github_pat_...
+export GITHUB_REPO=your-org/your-demo-repo
 
-# 2. Start the infrastructure (control plane + MinIO)
+# 2. Bring up control plane + MinIO + GitHub MCP sidecar
 docker compose up -d --build
 
-# 3. Launch a sandbox agent with a task
-./launch-sandbox.sh "Write a haiku about Docker and save it to haiku.txt"
+# 3. Launch a sandbox (builds the sandbox image on first run; this is slow
+#    because code-server + opencode is ~1 GB. Subsequent launches are quick.)
+./launch-sandbox.sh "demo session"
 
-# 4. The script follows logs automatically. To detach: Ctrl+C
-
-# 5. Inspect the session history via the control plane API
-curl -s localhost:8080/sessions | python3 -m json.tool
-
-# 6. Browse uploaded files in MinIO
-# Open http://localhost:9001 (login: minioadmin / minioadmin)
+# 4. Open VS Code in your browser (URL is printed by launch-sandbox.sh)
+#    Then in the integrated terminal:
+opencode
+> commit a hello.py to the repo that prints "hi"
 ```
 
-## Demo Script (for presentations)
+You should see a commit land on the configured GitHub repo within seconds. The agent never saw your PAT.
 
-### Demo 1: Zero-Secret Sandbox
+## Demo flow (for live presentations)
 
-Show that the sandbox has nothing worth stealing.
+### 1. "This looks like a normal dev environment" — *1 min*
+
+Switch to the browser tab showing code-server. Open the integrated terminal. Run `opencode`. Visually it's just VS Code; the audience won't think anything special is going on yet.
+
+### 2. "Now let's give it a real task" — *3 min*
+
+Ask the agent to write something small and commit it: *"add a function that reverses a string in `util.py` and commit it"*. Watch the agent reason, write code, and call the MCP tool. When it reports done, refresh the GitHub tab — the commit is there.
+
+### 3. "Now let's look at what the agent can't see" — *2 min*
+
+Open a second terminal on the host:
 
 ```bash
-# Launch an agent
-./launch-sandbox.sh "Write a haiku about Docker and save it to haiku.txt"
-
-# While it's running (or after), exec into the container
-docker exec sandbox-<session-id> env
-# → No secrets! SESSION_TOKEN is stripped from env after reading into memory.
-# → No ANTHROPIC_API_KEY — only the control plane has that.
-
-# Check what the agent created
-docker exec sandbox-<session-id> cat /workspace/haiku.txt
+docker exec sandbox-<id> env
 ```
 
-### Demo 2: Conversation History Survives Sandbox Death
-
-Show that state lives in the control plane, not the sandbox.
+No `ANTHROPIC_API_KEY`. No `GITHUB_PAT`. No AWS keys. Just the session token, control plane URL, and session id — and even those were stripped from the running process's env after startup (interactive shells get them back via `.bashrc` because opencode needs them; `env` directly shows nothing).
 
 ```bash
-# Launch an agent, let it complete
-./launch-sandbox.sh "Create a Python script that prints fibonacci numbers"
-
-# The container has exited, but the conversation is preserved:
-curl -s localhost:8080/sessions/<session-id> | python3 -m json.tool
-# → Full conversation history, file list, token usage — all in the control plane
+docker exec sandbox-<id> curl -m 3 https://api.anthropic.com
+docker exec sandbox-<id> curl -m 3 https://api.github.com
 ```
 
-### Demo 3: Parallel Sandboxes
-
-Show independent isolation and scaling.
+Both fail — the sandbox network has no public internet egress.
 
 ```bash
-# Launch 3 agents simultaneously with different tasks
-./launch-sandbox.sh "Write a Python function to sort a list" --no-follow &
-./launch-sandbox.sh "Write a bash script to check disk usage" --no-follow &
-./launch-sandbox.sh "Write a haiku about cloud computing" --no-follow &
-
-# Each gets its own isolated container, own session, own workspace
-docker ps --filter "name=sandbox"
-
-# Each session is independent
-curl -s localhost:8080/sessions | python3 -m json.tool
+docker exec github-mcp env | grep -i github
 ```
 
-### Demo 4: File Sync via Presigned URLs
+Also empty: the PAT isn't on the github-mcp sidecar either. It lives *only* in the control plane container, injected on each forwarded MCP request.
 
-Show how files move without the sandbox having storage credentials.
-
-```bash
-# Launch agent that creates files
-./launch-sandbox.sh "Create 3 text files with fun facts about Sweden"
-
-# Check MinIO — files synced without sandbox ever having AWS credentials
-# Open http://localhost:9001 (MinIO console, minioadmin/minioadmin)
-# Navigate to: agent-workspaces → <session-id> → files are there
-```
-
-### Demo 5: The Control Plane as the Single Gateway
-
-Show that the control plane mediates everything.
+### 4. "Everything went through the control plane" — *2 min*
 
 ```bash
-# Check system health
-curl -s localhost:8080/health | python3 -m json.tool
-
-# List all sessions with token usage
-curl -s localhost:8080/sessions | python3 -m json.tool
-
-# Get full detail on one session
 curl -s localhost:8080/sessions/<session-id> | python3 -m json.tool
 ```
 
-## Project Structure
+The full session audit: every LLM call (model, message count, snippet of the last user prompt), token usage, and the files persisted to MinIO. Open `http://localhost:9001` (minioadmin/minioadmin) — there's the agent's workspace mirrored to object storage, again via presigned URLs the sandbox got from the control plane.
+
+## Project structure
 
 ```
-├── docker-compose.yml          # Infrastructure: control plane + MinIO
-├── launch-sandbox.sh           # CLI to spawn sandbox containers
+.
+├── docker-compose.yml          # Control plane + MinIO + github-mcp sidecar, two networks
+├── launch-sandbox.sh           # Spawns a sandbox container for a session
+├── README.md                   # This file
 ├── CLAUDE.md                   # Project context for AI-assisted development
-├── control-plane/
+│
+├── control-plane/              # FastAPI gateway — holds every credential
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py                 # FastAPI control plane service
-│   ├── sessions.py             # Session management (in-memory)
-│   ├── llm_proxy.py            # LLM proxying to Anthropic API
-│   └── file_storage.py         # Presigned URL generation via MinIO
-└── sandbox/
-    ├── Dockerfile
+│   ├── main.py                 # Endpoints: /v1/messages, /mcp/github/*,
+│   │                           #   /files/*, /sessions/*, /health
+│   ├── sessions.py             # In-memory session + token store
+│   ├── llm_proxy.py            # Anthropic API passthrough
+│   └── file_storage.py         # MinIO presigned URL minter
+│
+├── github-mcp/                 # Sidecar: GitHub's official MCP server
+│   └── Dockerfile              # github-mcp-server v1.0.3 in HTTP mode
+│
+└── sandbox/                    # Image launched per session
+    ├── Dockerfile              # code-server + opencode + python + git shim
+    ├── entrypoint.sh           # Reads session env, strips, drops privileges
+    ├── start-services.sh       # Templates opencode config + AGENTS.md;
+    │                           #   starts file_sync, runs code-server
     ├── requirements.txt
-    ├── entrypoint.sh           # Privilege drop + env stripping
-    ├── agent.py                # The agent loop
-    ├── gateway.py              # Control plane gateway protocol
-    └── file_sync.py            # Workspace file sync via presigned URLs
+    └── file_sync.py            # Background workspace → MinIO uploader
 ```
 
-## Useful Commands
+## Useful commands
 
 ```bash
 # Rebuild after code changes
 docker compose up -d --build
 
-# Rebuild sandbox image after changes to sandbox/
-docker build -t sandbox-agent ./sandbox/
-
-# View control plane logs
+# Tail control plane logs (LLM calls, MCP proxy traffic, auth events)
 docker logs -f control-plane
 
-# Clean up stopped sandbox containers
-docker container prune -f --filter "label=sandbox"
+# Shell into a running sandbox as the unprivileged user
+docker exec -it --user sandbox sandbox-<session-id> bash
 
-# Full reset (removes all data)
+# Stop a sandbox
+docker stop sandbox-<session-id>
+
+# List sandbox containers
+docker ps --filter "name=sandbox-"
+
+# Full reset (drops MinIO data, deletes all session state)
 docker compose down -v
 ```
 
-## Changing the LLM Model
+## Configuration
 
-The default model is `claude-haiku-4-5-20251001`. To use a different Anthropic model:
+| Env var | Where it's set | Purpose |
+|---------|---------------|---------|
+| `ANTHROPIC_API_KEY` | host → control-plane only | Real Anthropic credential |
+| `ANTHROPIC_MODEL` | optional, control-plane | Overrides the default `claude-haiku-4-5-20251001` |
+| `GITHUB_PAT` | host → control-plane only | Real GitHub PAT |
+| `GITHUB_REPO` | host → sandbox env (not secret) | `owner/name`; templated into AGENTS.md so the agent knows where to commit |
+| `GITHUB_BRANCH` | host → sandbox env (not secret) | Defaults to `main` |
+| `LOG_LEVEL` | optional, control-plane | `INFO` (default) or `DEBUG` for wire-trace logging |
 
-1. Set the env var on the control plane in `docker-compose.yml`:
-   ```yaml
-   environment:
-     - ANTHROPIC_MODEL=claude-sonnet-4-6
-   ```
-2. Restart: `docker compose up -d`
+## Acknowledgements
+
+- The "isolate the agent" pattern is from [Larsen Cundric's Browser Use post](https://x.com/larsencc/article/2027225210412470668).
+- [opencode](https://opencode.ai) is the coding agent running inside the sandbox.
+- [github/github-mcp-server](https://github.com/github/github-mcp-server) provides the GitHub MCP tools.
+- [code-server](https://github.com/coder/code-server) provides the in-browser VS Code.
