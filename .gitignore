@@ -16,3 +16,6 @@ Thumbs.db
 # Docker volumes (managed by compose)
 minio-data/
 ollama-data/
+
+# Claude
+.claude
