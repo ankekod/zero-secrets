@@ -231,6 +231,31 @@ async def deactivate_session(session_id: str):
     return {"status": "deactivated"}
 
 
+@app.post("/sessions/{session_id}/resume")
+async def resume_session(session_id: str):
+    """
+    Hand a fresh sandbox the credentials needed to re-attach to an existing
+    session. The session_id and token are reused as-is so the S3 prefix
+    ({session_id}/...) lines up — a new sandbox launched with --resume gets
+    back the same view of the workspace it had before being torn down.
+
+    Sessions live in memory, so a control-plane restart loses them. We 404
+    rather than silently re-creating; restoring across CP restarts would need
+    a persistent session store.
+    """
+    session = store.get_by_id(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found (control plane may have restarted)")
+    if not session.active:
+        store.reactivate(session_id)
+    logger.info(f"Resumed session {session.session_id} ({session.task[:80]})")
+    return {
+        "session_id": session.session_id,
+        "token": session.token,
+        "task": session.task,
+    }
+
+
 # ─── Anthropic-compatible LLM proxy ─────────────────────────────
 
 async def _proxy_anthropic(request: Request, session: Session) -> StreamingResponse:

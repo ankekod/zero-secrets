@@ -73,3 +73,8 @@ class SessionStore:
         session = self._sessions.get(session_id)
         if session:
             session.active = False
+
+    def reactivate(self, session_id: str):
+        session = self._sessions.get(session_id)
+        if session:
+            session.active = True

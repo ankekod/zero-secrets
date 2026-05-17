@@ -8,6 +8,7 @@ set -e
 TOKEN="$1"
 CP_URL="$2"
 SID="$3"
+RESUME="${4:-0}"
 
 # Pin opencode to a default model. Provider config (base URL, API key) is set
 # via env vars below — opencode reads ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL
@@ -145,6 +146,14 @@ export ANTHROPIC_BASE_URL="${CP_URL}"
 export SESSION_TOKEN="${TOKEN}"
 export CONTROL_PLANE_URL="${CP_URL}"
 EOF
+
+# Resume mode: pull anything we previously uploaded for this session back
+# into /workspace before code-server (and file_sync) come up. Synchronous on
+# purpose — we want the workspace populated before the user opens VS Code.
+if [ "$RESUME" = "1" ]; then
+    echo "[start-services] resuming session $SID — restoring workspace from S3"
+    python /app/restore.py --token "$TOKEN" --control-plane "$CP_URL" || true
+fi
 
 # Background: continuously sync /workspace to MinIO via presigned URLs.
 python /app/file_sync.py \
