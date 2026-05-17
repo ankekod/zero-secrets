@@ -86,47 +86,6 @@ opencode
 
 You should see a commit land on the configured GitHub repo within seconds. The agent never saw your PAT.
 
-## Demo flow (for live presentations)
-
-### 1. "This looks like a normal dev environment" — *1 min*
-
-Switch to the browser tab showing code-server. Open the integrated terminal. Run `opencode`. Visually it's just VS Code; the audience won't think anything special is going on yet.
-
-### 2. "Now let's give it a real task" — *3 min*
-
-Ask the agent to write something small and commit it: *"add a function that reverses a string in `util.py` and commit it"*. Watch the agent reason, write code, and call the MCP tool. When it reports done, refresh the GitHub tab — the commit is there.
-
-### 3. "Now let's look at what the agent can't see" — *2 min*
-
-Open a second terminal on the host:
-
-```bash
-docker exec sandbox-<id> env
-```
-
-No `ANTHROPIC_API_KEY`. No `GITHUB_PAT`. No AWS keys. Just the session token, control plane URL, and session id — and even those were stripped from the running process's env after startup (interactive shells get them back via `.bashrc` because opencode needs them; `env` directly shows nothing).
-
-```bash
-docker exec sandbox-<id> curl -m 3 https://api.anthropic.com
-docker exec sandbox-<id> curl -m 3 https://api.github.com
-```
-
-Both fail — the sandbox network has no public internet egress.
-
-```bash
-docker exec github-mcp env | grep -i github
-```
-
-Also empty: the PAT isn't on the github-mcp sidecar either. It lives *only* in the control plane container, injected on each forwarded MCP request.
-
-### 4. "Everything went through the control plane" — *2 min*
-
-```bash
-curl -s localhost:8080/sessions/<session-id> | python3 -m json.tool
-```
-
-The full session audit: every LLM call (model, message count, snippet of the last user prompt), token usage, and the files persisted to MinIO. Open `http://localhost:9001` (minioadmin/minioadmin) — there's the agent's workspace mirrored to object storage, again via presigned URLs the sandbox got from the control plane.
-
 ## Project structure
 
 ```
